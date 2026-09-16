@@ -3,7 +3,7 @@
 from .client import ClaudeCLI, build_flags
 from .exceptions import ClaudeCLIError, ClaudeNotFoundError, ClaudeTimeoutError
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 __all__ = [
     "ClaudeCLI",
