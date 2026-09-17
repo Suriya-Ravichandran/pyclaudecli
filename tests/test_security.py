@@ -70,7 +70,9 @@ def test_module_entrypoint_separates_prompt():
     entry.ClaudeCLI = Fake
     try:
         with pytest.raises(SystemExit):
-            main(["--version"])
+            # `--` is the entrypoint's own escape hatch; --version alone is
+            # handled locally now (see tests/test_cli.py).
+            main(["--", "--version"])
     finally:
         entry.ClaudeCLI = original
 

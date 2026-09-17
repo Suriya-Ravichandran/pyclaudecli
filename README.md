@@ -169,12 +169,47 @@ pyclaudecli "What's 2+2?"                    # defaults to model "haiku"
 pyclaudecli --model sonnet "Explain this diff"
 pyclaudecli -m sonnet "Explain this diff"
 
-python -m pyclaudecli "Hello, Claude!"
+pyclaudecli --help                            # usage; -h works too
+pyclaudecli --version                         # this library + the claude CLI
+pyclaudecli --timeout 30 "Explain this diff"  # give up after 30s
+pyclaudecli -- "--version"                    # prompt *about* a flag
+
+python -m pyclaudecli "What's 2+2?"
+```
+
+`--help` and `--version` are answered locally — they're never forwarded to Claude, so
+neither costs an API call. Anything after `--` is prompt text, dashes included. An
+unrecognised flag is rejected with a pointer to `--` rather than silently prompted, so a
+typo like `--modle sonnet` fails instead of billing you for it. Running `pyclaudecli` with
+no arguments prints the usage.
+
+Failures print `pyclaudecli: <what went wrong>` on stderr — never a traceback — and pick
+an exit code you can branch on:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | success |
+| `1` | the `claude` CLI reported an error (its own exit code is used when it has one) |
+| `2` | bad usage — unknown option, missing value, no prompt |
+| `124` | the call exceeded `--timeout` |
+| `127` | the `claude` CLI isn't installed or isn't on `PATH` |
+| `130` | interrupted with Ctrl-C |
+| `141` | the pipe was closed downstream (`pyclaudecli ... \| head`) |
+
+```bash
+pyclaudecli --timeout 10 "Summarize this repo" || case $? in
+  2)   echo "I typed it wrong" ;;
+  124) echo "too slow" ;;
+  127) echo "install Claude Code first" ;;
+esac
 ```
 
 ## Errors
 
-All CLI failures raise `ClaudeCLIError` (or `ClaudeNotFoundError` / `ClaudeTimeoutError`), carrying `returncode`, `stdout`, `stderr`, and `cmd`.
+All CLI failures raise `ClaudeCLIError` (or `ClaudeNotFoundError` / `ClaudeTimeoutError` /
+`ClaudeUsageError`), carrying `returncode`, `stdout`, `stderr`, and `cmd`. Every one is a
+subclass of `ClaudeCLIError`, so a single `except ClaudeCLIError` catches anything the
+library raises.
 
 ```python
 from pyclaudecli import ClaudeCLI, ClaudeCLIError, ClaudeNotFoundError, ClaudeTimeoutError
@@ -190,6 +225,10 @@ except ClaudeNotFoundError as exc:
 except ClaudeCLIError as exc:
     print(exc.returncode, exc.stdout, exc.stderr)
 ```
+
+`ClaudeUsageError` is what the `pyclaudecli` command raises for a malformed command line
+(`returncode` 2, plus a `hint` naming the fix). It's exported so you can reuse the same
+parser and error style in your own wrapper scripts.
 
 ## `build_flags`
 

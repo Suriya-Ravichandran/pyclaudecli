@@ -30,3 +30,15 @@ class ClaudeNotFoundError(ClaudeCLIError):
 
 class ClaudeTimeoutError(ClaudeCLIError):
     """Raised when a `claude` invocation exceeds its timeout."""
+
+
+class ClaudeUsageError(ClaudeCLIError):
+    """Raised for a malformed `pyclaudecli` command line.
+
+    Carries `returncode=2`, the conventional exit status for a usage error,
+    and an optional `hint` with the fix to suggest.
+    """
+
+    def __init__(self, message: str, *, hint: Optional[str] = None) -> None:
+        super().__init__(message, returncode=2)
+        self.hint = hint
