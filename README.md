@@ -18,6 +18,7 @@ It's a thin wrapper, not a reimplementation — every call runs the real `claude
 - [Command-line usage](#command-line-usage)
 - [Errors](#errors)
 - [`build_flags`](#build_flags)
+- [Security notes](#security-notes)
 - [Every method, with an example](#every-method-with-an-example)
 - [Development](#development)
 - [License](#license)
@@ -56,6 +57,15 @@ claude = ClaudeCLI(
     env={"ANTHROPIC_API_KEY": "sk-ant-..."},
     timeout=120,
 )
+```
+
+`env` is merged **over** the current environment, so `PATH`, `HOME` and the rest still
+reach the CLI — passing one API key doesn't cost you the ability to find the binary or
+its credentials. Pass `replace_env=True` if you really want the child to start from a
+clean slate:
+
+```python
+claude = ClaudeCLI(env={"PATH": "/usr/bin", "HOME": "/tmp/sandbox"}, replace_env=True)
 ```
 
 ## Authentication
@@ -387,13 +397,49 @@ gateway.terminate()
 
 See `ClaudeCLI`'s docstrings for the exact CLI flags behind each method — it covers every top-level `claude` command (`auth`, `mcp`, `plugin`, `project`, `agents`/background sessions, `auto-mode`, `doctor`, `update`, `install`, `import`, `ultrareview`, `gateway`) plus the main prompt flags. Anything not exposed as a named parameter can still be passed through via each method's `extra_flags` dict.
 
+## Security notes
+
+A few things the wrapper does on your behalf, worth knowing if you're feeding it input
+from anywhere but your own code:
+
+**Prompts can't smuggle in CLI flags.** `prompt()`, `prompt_stream()`, `start_background()`
+and the `pyclaudecli` command put `--` between the options and your text, so a prompt that
+starts with a dash is text, not a flag. Without it, user-supplied input like
+`--dangerously-skip-permissions` or `--settings /tmp/evil.json` would be parsed by the CLI:
+
+```python
+claude.prompt("--version")   # asks Claude about "--version"; does not run the flag
+```
+
+Flags you actually want still go through named parameters or `extra_flags`. Note this
+protection covers the prompt text — if you interpolate untrusted input into a *flag value*
+(`model=`, `settings=`, `add_dir=`), validate it yourself.
+
+**Errors don't spill credentials.** `ClaudeCLIError.args`/`.cmd` and the exception message
+are redacted before they're raised, so MCP auth headers, injected `--env` values, tokens
+inside an `mcp add-json` payload and anything shaped like `sk-ant-…`, `Bearer …` or
+`password=…` come back as `<redacted>`. Flag names survive so the command is still
+recognisable, and long values are truncated. Tracebacks and log aggregators get the
+redacted form; `exc.stdout`/`exc.stderr` still hold the raw output for local debugging.
+
+**Login codes are handled as single-use secrets.** `auth_login()` writes exactly one line
+to the CLI's stdin — a code containing a newline can't inject extra input — and drops the
+code and the captured output from memory once it's submitted. The child process and its
+pipes are always cleaned up, including when your `code_provider` raises.
+
+Two things it deliberately does *not* do: it never runs a shell (every call is an argv
+list, so there's no shell-injection surface), and it doesn't manage credentials itself —
+auth lives with the `claude` CLI and your environment. Remember the argv of a running
+process is visible to other users on the same machine via `ps`, so prefer env vars over
+flags for anything sensitive.
+
 ## Development
 
 ```bash
 git clone https://github.com/Suriya-Ravichandran/pyclaudecli.git
 cd pyclaudecli
 pip install -e .
-pytest
+pytest          # offline; does not invoke the claude binary
 ```
 
 ## License

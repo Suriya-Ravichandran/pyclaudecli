@@ -14,6 +14,60 @@ from .exceptions import ClaudeCLIError, ClaudeNotFoundError, ClaudeTimeoutError
 
 _URL_PATTERN = re.compile(r"https://\S+")
 
+# Flags whose values are credentials (MCP auth headers, injected env vars).
+_SECRET_FLAGS = frozenset({"--header", "--env", "--client-id", "--client-secret"})
+
+# Credential shapes that can turn up anywhere in an argv, including inside the
+# JSON blob passed to `mcp add-json`.
+_SECRET_VALUE_PATTERN = re.compile(
+    r"""(
+        sk-ant-[\w-]+                      # Anthropic API keys
+      | pypi-[\w-]+                        # PyPI tokens
+      | gh[pousr]_[A-Za-z0-9]+             # GitHub tokens
+      | [Bb]earer\s+\S+                    # bearer tokens
+      | (?i:[\w.-]*(?:token|secret|key|password|passwd|auth)[\w.-]*)
+        \s*["\s]*[=:]\s*"?[^\s"',}]+       # anything token/secret/key-ish = value
+    )""",
+    re.VERBOSE,
+)
+
+_REDACTED = "<redacted>"
+_MAX_ARG_LEN = 120
+_MAX_DETAIL_LEN = 2000
+_MAX_LOGIN_BUFFER = 64 * 1024
+
+
+def redact_arg(value: str, limit: Optional[int] = _MAX_ARG_LEN) -> str:
+    """Masks credential-looking substrings, and truncates very long values."""
+    cleaned = _SECRET_VALUE_PATTERN.sub(_REDACTED, str(value))
+    if limit is not None and len(cleaned) > limit:
+        cleaned = cleaned[:limit] + "…"
+    return cleaned
+
+
+def redact_command(command: Sequence[str]) -> list:
+    """Returns a copy of an argv safe to put in an error message or a log.
+
+    Values of credential-bearing flags are replaced wholesale; everything else
+    is scanned for embedded secrets and truncated. Flag *names* survive, so the
+    command stays recognisable when debugging.
+    """
+    safe = []
+    masking = False
+    for token in command:
+        token = str(token)
+        if token.startswith("-"):
+            masking = token in _SECRET_FLAGS
+            safe.append(token)
+            continue
+        safe.append(_REDACTED if masking else redact_arg(token))
+    return safe
+
+
+def format_command(command: Sequence[str]) -> str:
+    """A redacted, shell-ish rendering of an argv for error messages."""
+    return " ".join(redact_command(command))
+
 
 @dataclass
 class CommandResult:
@@ -51,27 +105,27 @@ def run(
     except FileNotFoundError as exc:
         raise ClaudeNotFoundError(
             f"'{binary}' was not found on PATH. Is Claude Code installed?",
-            cmd=command,
+            cmd=redact_command(command),
         ) from exc
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         raise ClaudeTimeoutError(
-            f"'{' '.join(command)}' did not finish within {timeout}s",
-            cmd=command,
+            f"'{format_command(command)}' did not finish within {timeout}s",
+            cmd=redact_command(command),
             stdout=stdout,
             stderr=stderr,
         ) from exc
 
     result = CommandResult(command, completed.returncode, completed.stdout, completed.stderr)
     if check and not result.ok:
-        detail = (result.stderr or result.stdout or "").strip()
+        detail = redact_arg((result.stderr or result.stdout or "").strip(), limit=_MAX_DETAIL_LEN)
         raise ClaudeCLIError(
-            f"'{' '.join(command)}' exited with {result.returncode}: {detail}",
+            f"'{format_command(command)}' exited with {result.returncode}: {detail}",
             returncode=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
-            cmd=command,
+            cmd=redact_command(command),
         )
     return result
 
@@ -98,7 +152,7 @@ def stream_lines(
     except FileNotFoundError as exc:
         raise ClaudeNotFoundError(
             f"'{binary}' was not found on PATH. Is Claude Code installed?",
-            cmd=command,
+            cmd=redact_command(command),
         ) from exc
 
     assert proc.stdout is not None
@@ -110,9 +164,9 @@ def stream_lines(
         returncode = proc.wait()
         if returncode != 0:
             raise ClaudeCLIError(
-                f"'{' '.join(command)}' exited with {returncode}",
+                f"'{format_command(command)}' exited with {returncode}",
                 returncode=returncode,
-                cmd=command,
+                cmd=redact_command(command),
             )
 
 
@@ -134,7 +188,7 @@ def run_interactive(
     except FileNotFoundError as exc:
         raise ClaudeNotFoundError(
             f"'{binary}' was not found on PATH. Is Claude Code installed?",
-            cmd=command,
+            cmd=redact_command(command),
         ) from exc
 
 
@@ -173,7 +227,7 @@ def oauth_login(
     except FileNotFoundError as exc:
         raise ClaudeNotFoundError(
             f"'{binary}' was not found on PATH. Is Claude Code installed?",
-            cmd=command,
+            cmd=redact_command(command),
         ) from exc
 
     assert proc.stdout is not None and proc.stdin is not None
@@ -182,60 +236,83 @@ def oauth_login(
     url: Optional[str] = None
     deadline = time.time() + timeout
 
-    while time.time() < deadline and proc.poll() is None:
-        ready, _, _ = select.select([fd], [], [], 0.5)
-        if not ready:
-            continue
+    try:
+        while time.time() < deadline and proc.poll() is None:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if not ready:
+                continue
 
-        chunk = os.read(fd, 4096).decode(errors="replace")
-        if not chunk:
-            break
-
-        buffer += chunk
-        if on_output:
-            on_output(chunk)
-
-        if url is None:
-            match = _URL_PATTERN.search(buffer)
-            if match:
-                url = match.group(0)
-
-        if prompt_marker in buffer:
-            if code is not None:
-                entered_code = code
-            elif code_provider is not None:
-                entered_code = code_provider(url or "")
-            else:
-                entered_code = input("\nPaste the code from the browser here: ").strip()
-
-            proc.stdin.write(entered_code + "\n")
-            proc.stdin.flush()
-            proc.stdin.close()
-            buffer = ""
-            break
-    else:
-        if proc.poll() is None:
-            proc.kill()
-            raise ClaudeTimeoutError(
-                f"'{' '.join(command)}' did not produce a login prompt within {timeout}s",
-                cmd=command,
-            )
-
-    drain_deadline = time.time() + 30
-    while proc.poll() is None and time.time() < drain_deadline:
-        ready, _, _ = select.select([fd], [], [], 0.5)
-        if ready:
             chunk = os.read(fd, 4096).decode(errors="replace")
             if not chunk:
                 break
+
+            buffer += chunk
+            # A login that never reaches its prompt must not grow the buffer
+            # without bound; the marker and URL both live near the tail.
+            if len(buffer) > _MAX_LOGIN_BUFFER:
+                buffer = buffer[-_MAX_LOGIN_BUFFER:]
             if on_output:
                 on_output(chunk)
 
-    if proc.poll() is None:
-        proc.kill()
-        raise ClaudeTimeoutError(
-            f"'{' '.join(command)}' did not finish after the code was submitted",
-            cmd=command,
-        )
+            if url is None:
+                match = _URL_PATTERN.search(buffer)
+                if match:
+                    url = match.group(0)
 
-    return proc.returncode
+            if prompt_marker in buffer:
+                if code is not None:
+                    entered_code = code
+                elif code_provider is not None:
+                    entered_code = code_provider(url or "")
+                else:
+                    entered_code = input("\nPaste the code from the browser here: ")
+
+                # Only ever hand the child a single line: a code carrying a
+                # newline would otherwise write extra lines into its stdin.
+                entered_code = str(entered_code or "").splitlines()
+                entered_code = entered_code[0].strip() if entered_code else ""
+
+                proc.stdin.write(entered_code + "\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+                # Drop the code and the captured output rather than holding
+                # them in memory for the rest of the call.
+                entered_code = ""
+                buffer = ""
+                break
+        else:
+            if proc.poll() is None:
+                raise ClaudeTimeoutError(
+                    f"'{format_command(command)}' did not produce a login prompt within {timeout}s",
+                    cmd=redact_command(command),
+                )
+
+        drain_deadline = time.time() + 30
+        while proc.poll() is None and time.time() < drain_deadline:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if ready:
+                chunk = os.read(fd, 4096).decode(errors="replace")
+                if not chunk:
+                    break
+                if on_output:
+                    on_output(chunk)
+
+        if proc.poll() is None:
+            raise ClaudeTimeoutError(
+                f"'{format_command(command)}' did not finish after the code was submitted",
+                cmd=redact_command(command),
+            )
+
+        return proc.returncode
+    finally:
+        # Never leave a half-driven login (or its pipes) behind, whatever
+        # went wrong — including an exception raised by `code_provider`.
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None and not stream.closed:
+                    stream.close()
+            except (OSError, ValueError):
+                pass

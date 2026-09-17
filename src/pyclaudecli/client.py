@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
 
@@ -58,13 +59,32 @@ class ClaudeCLI:
         cwd: Optional[str] = None,
         env: Optional[dict] = None,
         timeout: Optional[float] = None,
+        replace_env: bool = False,
     ) -> None:
         self.binary = binary
         self.cwd = cwd
         self.env = env
         self.timeout = timeout
+        self.replace_env = replace_env
 
     # -- internals -----------------------------------------------------
+
+    def _env(self) -> Optional[dict]:
+        """The environment to hand the child process.
+
+        `env` is merged *over* the current environment by default. Replacing it
+        outright would drop PATH (so the binary may not resolve, or a different
+        one could), HOME and XDG_* (so `claude` would look for its credentials
+        and settings somewhere else), which is rarely what a caller passing a
+        single API key intends. Pass `replace_env=True` for a clean slate.
+        """
+        if self.env is None:
+            return None
+        if self.replace_env:
+            return {str(k): str(v) for k, v in self.env.items()}
+        merged = os.environ.copy()
+        merged.update({str(k): str(v) for k, v in self.env.items()})
+        return merged
 
     def run(
         self,
@@ -79,7 +99,7 @@ class ClaudeCLI:
             self.binary,
             args,
             cwd=self.cwd,
-            env=self.env,
+            env=self._env(),
             input_text=input_text,
             timeout=timeout if timeout is not None else self.timeout,
             check=check,
@@ -93,17 +113,18 @@ class ClaudeCLI:
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
+            command = [self.binary, *args]
             raise ClaudeCLIError(
-                f"Expected JSON from `{self.binary} {' '.join(args)}`, "
-                f"got: {result.stdout[:200]!r}",
+                f"Expected JSON from `{_process.format_command(command)}`, "
+                f"got: {_process.redact_arg(result.stdout[:200])!r}",
                 returncode=result.returncode,
                 stdout=result.stdout,
                 stderr=result.stderr,
-                cmd=[self.binary, *args],
+                cmd=_process.redact_command(command),
             ) from exc
 
     def _interactive(self, args: Sequence[str]) -> int:
-        return _process.run_interactive(self.binary, args, cwd=self.cwd, env=self.env)
+        return _process.run_interactive(self.binary, args, cwd=self.cwd, env=self._env())
 
     # -- version / health ------------------------------------------------
 
@@ -197,7 +218,10 @@ class ClaudeCLI:
         args = ["--print"] + build_flags(options)
         if continue_session:
             args.append("--continue")
-        args.append(text)
+        # `--` ends option parsing: without it a prompt that happens to start
+        # with a dash is read as CLI flags, so untrusted text could turn on
+        # things like --dangerously-skip-permissions.
+        args += ["--", text]
 
         result = self.run(args, input_text=input_text, timeout=timeout)
         if output_format == "json":
@@ -217,8 +241,8 @@ class ClaudeCLI:
         extra_flags["verbose"] = True  # required by the CLI for --print + stream-json
 
         options = {k: v for k, v in extra_flags.items() if v is not None and v is not False}
-        args = ["--print"] + build_flags(options) + [text]
-        for line in _process.stream_lines(self.binary, args, cwd=self.cwd, env=self.env):
+        args = ["--print"] + build_flags(options) + ["--", text]
+        for line in _process.stream_lines(self.binary, args, cwd=self.cwd, env=self._env()):
             line = line.strip()
             if line:
                 yield json.loads(line)
@@ -237,7 +261,7 @@ class ClaudeCLI:
         """`claude --bg <task>`; returns the short session id it prints."""
         options = dict(model=model, name=name, resume=resume)
         options.update(extra_flags or {})
-        args = ["--bg"] + build_flags(options) + [task]
+        args = ["--bg"] + build_flags(options) + ["--", task]
         output = self._text(args)
         match = re.search(r"backgrounded\W*([0-9a-fA-F]+)", output)
         if not match:
@@ -314,7 +338,7 @@ class ClaudeCLI:
             self.binary,
             args,
             cwd=self.cwd,
-            env=self.env,
+            env=self._env(),
             code=code,
             code_provider=code_provider,
             on_output=on_output or (lambda chunk: print(chunk, end="", flush=True)),
@@ -578,4 +602,4 @@ class ClaudeCLI:
         import subprocess
 
         args = [self.binary, "gateway", *build_flags({"config": config})]
-        return subprocess.Popen(args, cwd=self.cwd, env=self.env)
+        return subprocess.Popen(args, cwd=self.cwd, env=self._env())

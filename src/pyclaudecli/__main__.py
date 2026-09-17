@@ -45,7 +45,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     model, prompt = parse_args(argv)
     client = ClaudeCLI()
     try:
-        result = client.run(["--print", "--model", model, prompt], check=False)
+        # `--` keeps a prompt that starts with a dash from being parsed as
+        # flags by the CLI (this parser passes unknown args through as text).
+        result = client.run(["--print", "--model", model, "--", prompt], check=False)
     except Exception as exc:  # ClaudeNotFoundError, etc.
         print(str(exc), file=sys.stderr)
         return 1
