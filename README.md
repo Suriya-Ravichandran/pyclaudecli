@@ -14,6 +14,7 @@ It's a thin wrapper, not a reimplementation — every call runs the real `claude
 - [Install](#install)
 - [Quickstart](#quickstart)
 - [Setup](#setup)
+- [Authentication](#authentication)
 - [Command-line usage](#command-line-usage)
 - [Errors](#errors)
 - [`build_flags`](#build_flags)
@@ -55,6 +56,94 @@ claude = ClaudeCLI(
     env={"ANTHROPIC_API_KEY": "sk-ant-..."},
     timeout=120,
 )
+```
+
+## Authentication
+
+`claude` handles auth itself, so `pyclaudecli` just drives it. You have two options.
+
+### API key
+
+Pass the key through the environment — either inherited from your shell or set per client:
+
+```python
+from pyclaudecli import ClaudeCLI
+
+claude = ClaudeCLI(env={"ANTHROPIC_API_KEY": "sk-ant-..."})
+```
+
+### OAuth login (paste the code)
+
+`auth_login()` runs `claude auth login`, prints the sign-in URL, waits for the CLI's
+"Paste code here" prompt, and writes your code back to it. With no arguments it reads the
+code from stdin, so this is the whole interactive flow:
+
+```python
+from pyclaudecli import ClaudeCLI
+
+claude = ClaudeCLI()
+
+if not claude.auth_status().get("loggedIn"):
+    # Prints the sign-in URL, then asks: "Paste the code from the browser here:"
+    exit_code = claude.auth_login()
+    print("login exit code:", exit_code)
+
+print(claude.auth_status())   # {"loggedIn": True, "email": "you@example.com", ...}
+```
+
+To capture the URL yourself (open it in a browser, send it to a chat, log it) and paste the
+code back without stdin, use `on_output` plus `code_provider`:
+
+```python
+import re
+
+URL_RE = re.compile(r"https://\S+")
+login_url = None
+
+def capture(chunk: str) -> None:
+    global login_url
+    print(chunk, end="", flush=True)          # or log.info(chunk)
+    if login_url is None:
+        match = URL_RE.search(chunk)
+        if match:
+            login_url = match.group(0)
+
+def supply_code(url: str) -> str:
+    # `url` is the sign-in URL pyclaudecli found in the CLI's output.
+    # Open it however you like, then return the code the browser shows.
+    print(f"\nOpen this URL and approve the login:\n{url}\n")
+    return input("Paste code here: ").strip()
+
+claude.auth_login(
+    on_output=capture,
+    code_provider=supply_code,
+    console=True,      # --console: force the URL/console flow instead of opening a browser
+    timeout=300,       # how long to wait for the "Paste code here" prompt
+)
+```
+
+Fully non-interactive — when the code already came from somewhere else (a queue, a
+browser-automation step, an operator pasting it into your own UI):
+
+```python
+claude.auth_login(code="123456")
+
+# Or fetch it programmatically from the printed sign-in URL
+claude.auth_login(code_provider=lambda url: fetch_code_from_my_browser(url))
+
+# Enterprise SSO, or pre-filling the account
+claude.auth_login(sso=True)
+claude.auth_login(email="you@example.com")
+```
+
+`auth_login()` returns the CLI's exit code (`0` on success) and raises `ClaudeTimeoutError`
+if the login prompt never appears within `timeout` seconds.
+
+Signing out, and long-lived tokens for CI:
+
+```python
+claude.auth_logout()
+claude.setup_token()   # interactive; sets up a long-lived auth token
 ```
 
 ## Command-line usage
@@ -199,6 +288,9 @@ claude.rm(session_id)                          # delete a stopped session
 claude.auth_status()                # {"loggedIn": True, "email": "...", ...}
 claude.auth_status(as_json=False)   # human-readable text instead
 
+# Interactive OAuth: prints the sign-in URL, then reads the pasted code from stdin
+claude.auth_login()
+
 # Non-interactive login: supply the code yourself
 claude.auth_login(code="123456")
 
@@ -207,6 +299,9 @@ claude.auth_login(code_provider=lambda url: fetch_code_from_my_browser(url))
 
 # Route the printed sign-in URL/output somewhere other than stdout
 claude.auth_login(on_output=lambda chunk: log.info(chunk), console=True, timeout=120)
+
+claude.auth_login(sso=True)                      # enterprise SSO
+claude.auth_login(email="you@example.com")       # pre-fill the account
 
 claude.auth_logout()
 claude.setup_token()   # interactive; sets up a long-lived auth token
