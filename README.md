@@ -31,6 +31,10 @@ pip install pyclaudecli
 
 Requires the `claude` CLI itself to be installed and on `PATH` (see the [Claude Code docs](https://claude.com/claude-code)).
 
+Runs on Linux, macOS and Windows, Python 3.8+. On Windows the CLI is installed as
+`claude.cmd`, which `CreateProcess` won't find from a bare `"claude"` — the wrapper
+resolves it through `PATHEXT` for you, so the default `ClaudeCLI()` works there too.
+
 ## Quickstart
 
 ```python
@@ -432,6 +436,9 @@ list, so there's no shell-injection surface), and it doesn't manage credentials 
 auth lives with the `claude` CLI and your environment. Remember the argv of a running
 process is visible to other users on the same machine via `ps`, so prefer env vars over
 flags for anything sensitive.
+
+Every call is an argv list on every platform — no shell, and no `shell=True` fallback on
+Windows, so quoting rules can't be turned into an injection.
 
 ## Development
 

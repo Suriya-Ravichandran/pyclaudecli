@@ -601,5 +601,6 @@ class ClaudeCLI:
         """
         import subprocess
 
-        args = [self.binary, "gateway", *build_flags({"config": config})]
-        return subprocess.Popen(args, cwd=self.cwd, env=self._env())
+        env = self._env()
+        args = [_process.resolve_binary(self.binary, env), "gateway", *build_flags({"config": config})]
+        return subprocess.Popen(args, cwd=self.cwd, env=env)

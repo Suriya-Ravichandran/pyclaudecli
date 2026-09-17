@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
-import select
+import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional, Sequence
@@ -69,6 +71,63 @@ def format_command(command: Sequence[str]) -> str:
     return " ".join(redact_command(command))
 
 
+def resolve_binary(binary: str, env: Optional[dict] = None) -> str:
+    """Finds the executable to run, the same way a shell would.
+
+    On Windows the `claude` CLI is an npm shim (`claude.cmd`), and
+    CreateProcess only ever appends `.exe` — so a bare "claude" is not found
+    unless it is resolved through PATHEXT first. `shutil.which` handles that,
+    and on POSIX it is a no-op beyond returning the absolute path.
+
+    Falls back to the name as given (an explicit path, or something the OS can
+    still resolve), so the usual ClaudeNotFoundError is what callers see.
+    """
+    if os.path.dirname(binary):
+        return binary
+    path = (env or os.environ).get("PATH")
+    return shutil.which(binary, path=path) or binary
+
+
+class _PipeReader:
+    """Reads a child's stdout from a thread, so waiting works everywhere.
+
+    `select` only accepts sockets on Windows, so it cannot be used to poll a
+    subprocess pipe. A daemon thread doing blocking reads is portable, and
+    still hands back partial output the moment it arrives — which matters for
+    a login prompt that never ends in a newline.
+    """
+
+    _EOF = object()
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._chunks: "queue.Queue" = queue.Queue()
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                data = os.read(self._fd, 4096)
+                if not data:
+                    break
+                self._chunks.put(data)
+        except (OSError, ValueError):
+            pass  # pipe closed underneath us; treated as EOF
+        finally:
+            self._chunks.put(self._EOF)
+
+    def read(self, timeout: float) -> Optional[str]:
+        """Returns decoded output, "" if nothing arrived in time, None at EOF."""
+        try:
+            item = self._chunks.get(timeout=timeout)
+        except queue.Empty:
+            return ""
+        if item is self._EOF:
+            return None
+        return item.decode("utf-8", errors="replace")
+
+
 @dataclass
 class CommandResult:
     args: list
@@ -91,7 +150,7 @@ def run(
     timeout: Optional[float] = None,
     check: bool = True,
 ) -> CommandResult:
-    command = [binary, *args]
+    command = [resolve_binary(binary, env), *args]
     try:
         completed = subprocess.run(
             command,
@@ -138,7 +197,7 @@ def stream_lines(
     env: Optional[dict] = None,
 ) -> Iterator[str]:
     """Runs a command and yields decoded stdout lines as they arrive."""
-    command = [binary, *args]
+    command = [resolve_binary(binary, env), *args]
     try:
         proc = subprocess.Popen(
             command,
@@ -182,7 +241,7 @@ def run_interactive(
     For subcommands that need a real terminal (attach, setup-token, an
     interactive mcp/import picker) rather than captured output.
     """
-    command = [binary, *args]
+    command = [resolve_binary(binary, env), *args]
     try:
         return subprocess.call(command, cwd=cwd, env=env)
     except FileNotFoundError as exc:
@@ -212,7 +271,7 @@ def oauth_login(
     found in the output so far. Falls back to `input()` if neither is given.
     Returns the child's exit code.
     """
-    command = [binary, *args]
+    command = [resolve_binary(binary, env), *args]
     try:
         proc = subprocess.Popen(
             command,
@@ -231,20 +290,22 @@ def oauth_login(
         ) from exc
 
     assert proc.stdout is not None and proc.stdin is not None
-    fd = proc.stdout.fileno()
+    # Send exactly "\n", not the platform line ending: on Windows text mode
+    # would translate it to "\r\n" and the CLI would read a stray CR.
+    if hasattr(proc.stdin, "reconfigure"):
+        proc.stdin.reconfigure(newline="\n")
+    reader = _PipeReader(proc.stdout.fileno())
     buffer = ""
     url: Optional[str] = None
     deadline = time.time() + timeout
 
     try:
         while time.time() < deadline and proc.poll() is None:
-            ready, _, _ = select.select([fd], [], [], 0.5)
-            if not ready:
-                continue
-
-            chunk = os.read(fd, 4096).decode(errors="replace")
-            if not chunk:
+            chunk = reader.read(0.5)
+            if chunk is None:  # the child closed its output
                 break
+            if not chunk:
+                continue
 
             buffer += chunk
             # A login that never reaches its prompt must not grow the buffer
@@ -289,21 +350,21 @@ def oauth_login(
 
         drain_deadline = time.time() + 30
         while proc.poll() is None and time.time() < drain_deadline:
-            ready, _, _ = select.select([fd], [], [], 0.5)
-            if ready:
-                chunk = os.read(fd, 4096).decode(errors="replace")
-                if not chunk:
-                    break
-                if on_output:
-                    on_output(chunk)
+            chunk = reader.read(0.5)
+            if chunk is None:
+                break
+            if chunk and on_output:
+                on_output(chunk)
 
-        if proc.poll() is None:
+        # Reaching EOF on stdout does not mean the child has exited yet, so
+        # give it a moment to actually finish rather than calling it a timeout.
+        try:
+            return proc.wait(timeout=max(drain_deadline - time.time(), 5))
+        except subprocess.TimeoutExpired:
             raise ClaudeTimeoutError(
                 f"'{format_command(command)}' did not finish after the code was submitted",
                 cmd=redact_command(command),
-            )
-
-        return proc.returncode
+            ) from None
     finally:
         # Never leave a half-driven login (or its pipes) behind, whatever
         # went wrong — including an exception raised by `code_provider`.
